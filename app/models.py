@@ -54,7 +54,7 @@ class UserBase(BaseModel):
 class UserCreate(UserBase):
     """User creation model."""
     password: str = Field(..., min_length=6, max_length=100)
-    role: UserRole = UserRole.CLIENT
+    role: UserRole = Field(default=UserRole.CLIENT)
 
 
 class UserResponse(UserBase):
@@ -132,7 +132,7 @@ class BookingBase(BaseModel):
     room_type_reserved: str = Field(..., min_length=1, max_length=100)
     no_of_week_nights: int = Field(..., ge=0)
     no_of_weekend_nights: int = Field(..., ge=0)
-    repeated_guest: bool
+    repeated_guest: int = Field(..., ge=0, description="Number of previous bookings made by this user")
     type_of_meal_plan: int = Field(..., ge=0)
     no_of_special_requests: int = Field(..., ge=0)
     avg_price_per_room: Decimal = Field(..., gt=0)
@@ -175,7 +175,8 @@ class Token(BaseModel):
     """JWT token response model."""
     access_token: str
     token_type: str = "bearer"
-    expires_in: int
+    expires_in: Optional[int] = None
+    data: Optional[dict] = None
 
 
 class TokenData(BaseModel):

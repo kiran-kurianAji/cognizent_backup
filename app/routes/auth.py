@@ -74,6 +74,14 @@ async def register_hotel(hotel_data: HotelRegistration):
                 detail="Failed to create admin user"
             )
         
+        # Create initial history entry for new admin user (for tracking repeated guests)
+        # This ensures that future bookings can properly compute repeated_guest count
+        history_data = {
+            "user_id": admin_id,
+            "booking_id": None  # No booking ID for initial signup entry
+        }
+        client.table("history").insert(history_data).execute()
+        
         # Hotel information is stored in the admin user record (hotel = admin)
         
         return HotelRegistrationResponse(
@@ -102,16 +110,16 @@ async def register_hotel(hotel_data: HotelRegistration):
         )
 
 
-@router.post("/register", response_model=APIResponse)
+@router.post("/register", response_model=Token)
 async def register_user(user_data: UserCreate):
     """
-    Register a new user (client or admin).
+    Register a new user (client or admin) and return JWT token.
     
     Args:
         user_data: User registration data including email, password, and role
         
     Returns:
-        APIResponse: Success message with user details
+        Token: JWT access token with user details
     """
     try:
         client = get_db_client()
@@ -151,13 +159,29 @@ async def register_user(user_data: UserCreate):
                 detail="Failed to create user"
             )
         
-        return APIResponse(
-            success=True,
-            message="User registered successfully",
+        # Create initial history entry for new user (for tracking repeated guests)
+        # This ensures that future bookings can properly compute repeated_guest count
+        history_data = {
+            "user_id": user_id,
+            "booking_id": None  # No booking ID for initial signup entry
+        }
+        client.table("history").insert(history_data).execute()
+        
+        # Create access token for the newly registered user
+        access_token_expires = timedelta(minutes=settings.access_token_expire_minutes)
+        access_token = create_access_token(
+            data={"sub": user_data.email, "user_id": user_id, "role": user_data.role.value},
+            expires_delta=access_token_expires
+        )
+        
+        return Token(
+            access_token=access_token,
+            token_type="bearer",
             data={
                 "user_id": user_id,
                 "email": user_data.email,
-                "role": user_data.role.value
+                "role": user_data.role.value,
+                "full_name": user_data.full_name
             }
         )
         

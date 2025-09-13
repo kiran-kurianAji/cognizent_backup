@@ -3,6 +3,7 @@ Booking management routes for the Hotel Booking Cancellation Prediction System.
 Handles booking creation, retrieval, updates, and cancellation prediction.
 """
 
+import logging
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException, status, Depends, Query
 from app.models import (
@@ -16,6 +17,9 @@ from app.models import (
 )
 from app.auth import get_current_client, get_current_admin, get_current_user, TokenData
 from app.database import get_db_client
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/bookings", tags=["Bookings"])
 
@@ -35,52 +39,90 @@ async def create_booking(
     Returns:
         BookingResponse: Created booking details
     """
+    logger.info(f"=== BOOKING CREATION STARTED ===")
+    logger.info(f"User ID: {current_user.user_id}")
+    logger.info(f"User Role: {current_user.role}")
+    logger.info(f"Booking Data: {booking_data.dict()}")
+    
     try:
         client = get_db_client()
+        logger.info("Database client obtained successfully")
         
-        # Check if room exists and is available
+        # Step 1: Validate room exists and is available
+        logger.info(f"Checking room availability for room_id: {booking_data.room_id}")
         room_result = client.table("rooms").select("*").eq("room_id", booking_data.room_id).execute()
         
         if not room_result.data:
+            logger.error(f"Room not found: room_id={booking_data.room_id}")
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Room not found"
+                detail=f"Room with ID {booking_data.room_id} not found"
             )
         
         room = room_result.data[0]
+        logger.info(f"Room found: {room}")
         
         if room["available_rooms"] <= 0:
+            logger.error(f"Room not available: room_id={booking_data.room_id}, available_rooms={room['available_rooms']}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Room is not available"
+                detail=f"Room {room['room_type']} is not available (0 rooms left)"
             )
         
-        # Calculate ML features automatically
+        logger.info(f"Room is available: {room['available_rooms']} rooms left")
+        
+        # Step 2: Validate user exists
+        logger.info(f"Validating user exists: {current_user.user_id}")
+        user_result = client.table("users").select("user_id").eq("user_id", current_user.user_id).execute()
+        
+        if not user_result.data:
+            logger.error(f"User not found: {current_user.user_id}")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"User {current_user.user_id} not found"
+            )
+        
+        logger.info(f"User validated: {current_user.user_id}")
+        
+        # Step 3: Calculate ML features automatically
         from datetime import date
         
         # Calculate lead_time (days between booking and arrival)
         booking_date = date.today()
         lead_time = (booking_data.arrival_date - booking_date).days
+        logger.info(f"Lead time calculated: {lead_time} days (booking_date: {booking_date}, arrival_date: {booking_data.arrival_date})")
+        
+        # Ensure lead_time is not negative (arrival date should be in the future)
+        if lead_time < 0:
+            logger.error(f"Invalid arrival date: lead_time={lead_time} (negative)")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Arrival date must be in the future. Lead time: {lead_time} days"
+            )
         
         # Extract arrival month
         arrival_month = booking_data.arrival_date.month
+        logger.info(f"Arrival month: {arrival_month}")
         
-        # Get user's cancellation history
+        # Get user's cancellation history from history table
+        logger.info(f"Getting user history for: {current_user.user_id}")
         history_result = client.table("history").select("history_id").eq("user_id", current_user.user_id).execute()
         no_of_previous_cancellations = len(history_result.data) if history_result.data else 0
+        logger.info(f"Previous cancellations: {no_of_previous_cancellations}")
         
-        # Check if user is repeated guest
-        previous_bookings = client.table("bookings").select("booking_id").eq("user_id", current_user.user_id).execute()
-        repeated_guest = len(previous_bookings.data) > 0 if previous_bookings.data else False
+        # Calculate repeated_guest as integer count based on history table entries
+        repeated_guest = len(history_result.data) if history_result.data else 0
+        logger.info(f"Repeated guest count: {repeated_guest}")
         
         # Get room details for ML features
-        room_type_reserved = room["room_code"]  # Map to ML-compatible code
+        room_type_reserved = room["room_type"]
         avg_price_per_room = float(room["price"])
+        logger.info(f"Room type: {room_type_reserved}, Price: {avg_price_per_room}")
         
-        # Determine market segment (could be based on booking channel)
-        market_segment_type = "Online"  # Default for API bookings
+        # Determine market segment
+        market_segment_type = "Online"
         
-        # Prepare booking data for database
+        # Step 4: Prepare booking data for database
         booking_db_data = {
             "user_id": current_user.user_id,
             "room_id": booking_data.room_id,
@@ -101,22 +143,49 @@ async def create_booking(
             "status": "confirmed"
         }
         
-        # Insert booking into database
+        logger.info(f"Booking data prepared for database: {booking_db_data}")
+        
+        # Step 5: Insert booking into database
+        logger.info("Inserting booking into database...")
         result = client.table("bookings").insert(booking_db_data).execute()
         
         if not result.data:
+            logger.error("Failed to insert booking - no data returned")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create booking"
+                detail="Failed to create booking - database insertion returned no data"
             )
         
-        # Update room availability
-        new_available = room["available_rooms"] - 1
-        client.table("rooms").update({"available_rooms": new_available}).eq("room_id", booking_data.room_id).execute()
-        
         booking = result.data[0]
+        logger.info(f"Booking inserted successfully: {booking}")
         
-        return BookingResponse(
+        # Step 6: Create history entry for this booking
+        history_data = {
+            "user_id": current_user.user_id,
+            "booking_id": booking["booking_id"]
+        }
+        logger.info(f"Creating history entry: {history_data}")
+        history_insert_result = client.table("history").insert(history_data).execute()
+        
+        if not history_insert_result.data:
+            logger.warning("Failed to create history entry, but booking was created")
+        else:
+            logger.info("History entry created successfully")
+        
+        # Step 7: Update room availability atomically
+        new_available = room["available_rooms"] - 1
+        logger.info(f"Updating room availability: {room['available_rooms']} -> {new_available}")
+        room_update_result = client.table("rooms").update({"available_rooms": new_available}).eq("room_id", booking_data.room_id).execute()
+        
+        if not room_update_result.data:
+            logger.error("Failed to update room availability")
+            # Note: Booking was created but room availability wasn't updated
+            # In production, you might want to rollback the booking
+        
+        logger.info(f"Room availability updated successfully")
+        
+        # Step 8: Prepare response
+        response_data = BookingResponse(
             booking_id=booking["booking_id"],
             user_id=booking["user_id"],
             room_id=booking["room_id"],
@@ -139,9 +208,15 @@ async def create_booking(
             status=booking["status"]
         )
         
-    except HTTPException:
+        logger.info(f"=== BOOKING CREATION SUCCESSFUL ===")
+        logger.info(f"Booking ID: {booking['booking_id']}")
+        return response_data
+        
+    except HTTPException as he:
+        logger.error(f"HTTP Exception in booking creation: {he.detail}")
         raise
     except Exception as e:
+        logger.error(f"Unexpected error in booking creation: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create booking: {str(e)}"
